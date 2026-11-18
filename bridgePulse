@@ -1,0 +1,1250 @@
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+
+// ============================================
+// BRIDGEPULSE 2.0
+// REAL-TIME GRAPHICAL BRIDGE MONITORING
+// ESP32 + MPU6500/MPU6050 + IR + LCD
+// ============================================
+
+// CONNECTIONS
+#define MPU_SDA 18
+#define MPU_SCL 19
+#define LCD_SDA 21
+#define LCD_SCL 22
+#define IR_PIN 27
+
+#define LCD_ADDRESS 0x27
+#define IR_ACTIVE_LOW true
+
+// WARNING THRESHOLDS
+const float ANGLE_LIMIT = 1.7f;
+const float TEMP_LIMIT = 36.0f;
+
+// THREE CONSECUTIVE READINGS TO CONFIRM
+const int CONFIRM_COUNT = 3;
+
+// TIMING
+const unsigned long SAMPLE_MS = 50;
+const unsigned long LCD_MS = 500;
+
+// DEVICES
+TwoWire MPU = TwoWire(1);
+LiquidCrystal_I2C lcd(LCD_ADDRESS, 16, 2);
+WebServer server(80);
+
+// WIFI
+const char* WIFI_NAME = "BridgePulse";
+const char* WIFI_PASS = "bridge1234";
+
+// MPU
+uint8_t mpuAddress = 0;
+uint8_t chipID = 0;
+
+bool sensorOK = false;
+
+float baselineX = 0;
+float baselineY = 0;
+float baselineZ = 1;
+
+// READINGS
+float angleChange = 0;
+float temperatureC = 0;
+
+float maxAngle = 0;
+float maxTemperature = -100;
+
+bool angleAlert = false;
+bool tempAlert = false;
+bool irDetected = false;
+
+int angleCount = 0;
+int tempCount = 0;
+int irCount = 0;
+int readFailures = 0;
+
+unsigned long lastSample = 0;
+unsigned long lastLCD = 0;
+
+enum BridgeStatus {
+  NORMAL,
+  ANGLE_WARNING,
+  GROUND_WARNING,
+  TEMP_WARNING,
+  CRITICAL,
+  SENSOR_ERROR
+};
+
+BridgeStatus status = SENSOR_ERROR;
+
+// ============================================
+// DIRECT I2C
+// ============================================
+
+bool writeReg(uint8_t reg, uint8_t val) {
+  MPU.beginTransmission(mpuAddress);
+  MPU.write(reg);
+  MPU.write(val);
+  return MPU.endTransmission() == 0;
+}
+
+bool readReg(uint8_t reg, uint8_t &val) {
+  MPU.beginTransmission(mpuAddress);
+  MPU.write(reg);
+
+  if (MPU.endTransmission(false) != 0)
+    return false;
+
+  if (MPU.requestFrom(mpuAddress, (uint8_t)1) != 1)
+    return false;
+
+  val = MPU.read();
+  return true;
+}
+
+// ============================================
+// READ ACCELEROMETER AND TEMPERATURE
+// ============================================
+
+bool readSensor(
+  float &x,
+  float &y,
+  float &z,
+  float &temp
+) {
+  MPU.beginTransmission(mpuAddress);
+  MPU.write(0x3B);
+
+  if (MPU.endTransmission(false) != 0)
+    return false;
+
+  if (MPU.requestFrom(mpuAddress, (uint8_t)8) != 8)
+    return false;
+
+  int16_t ax = (int16_t)(
+    (MPU.read() << 8) | MPU.read()
+  );
+
+  int16_t ay = (int16_t)(
+    (MPU.read() << 8) | MPU.read()
+  );
+
+  int16_t az = (int16_t)(
+    (MPU.read() << 8) | MPU.read()
+  );
+
+  int16_t rawTemp = (int16_t)(
+    (MPU.read() << 8) | MPU.read()
+  );
+
+  x = ax / 16384.0f;
+  y = ay / 16384.0f;
+  z = az / 16384.0f;
+
+  if (chipID == 0x70) {
+    // MPU6500-family
+    temp = rawTemp / 333.87f + 21.0f;
+  } else {
+    // MPU6050-family
+    temp = rawTemp / 340.0f + 36.53f;
+  }
+
+  return true;
+}
+
+// ============================================
+// INITIALIZE MPU
+// ============================================
+
+bool initializeMPU() {
+  mpuAddress = 0;
+
+  for (uint8_t a = 0x68; a <= 0x69; a++) {
+    MPU.beginTransmission(a);
+
+    if (MPU.endTransmission() == 0) {
+      mpuAddress = a;
+      break;
+    }
+  }
+
+  if (!mpuAddress)
+    return false;
+
+  if (!readReg(0x75, chipID))
+    return false;
+
+  Serial.print("WHO_AM_I: 0x");
+  Serial.println(chipID, HEX);
+
+  if (chipID != 0x70 && chipID != 0x68)
+    return false;
+
+  if (!writeReg(0x6B, 0x00))
+    return false;
+
+  delay(200);
+
+  if (!writeReg(0x1C, 0x00))
+    return false;
+
+  if (!writeReg(0x1B, 0x00))
+    return false;
+
+  if (!writeReg(0x1A, 0x04))
+    return false;
+
+  return true;
+}
+
+// ============================================
+// CALIBRATION
+// ============================================
+
+bool calibrateMPU() {
+  float sx = 0, sy = 0, sz = 0;
+  int valid = 0;
+
+  for (int i = 0; i < 100; i++) {
+    float x, y, z, t;
+
+    if (readSensor(x, y, z, t)) {
+      sx += x;
+      sy += y;
+      sz += z;
+      valid++;
+    }
+
+    delay(20);
+  }
+
+  if (valid < 80)
+    return false;
+
+  float x = sx / valid;
+  float y = sy / valid;
+  float z = sz / valid;
+
+  float magnitude = sqrtf(x*x + y*y + z*z);
+
+  if (magnitude < 0.1f)
+    return false;
+
+  baselineX = x / magnitude;
+  baselineY = y / magnitude;
+  baselineZ = z / magnitude;
+
+  return true;
+}
+
+// ============================================
+// ANGLE RELATIVE TO STARTING POSITION
+// ============================================
+
+float calculateAngle(float x, float y, float z) {
+  float magnitude = sqrtf(x*x + y*y + z*z);
+
+  if (magnitude < 0.1f)
+    return NAN;
+
+  x /= magnitude;
+  y /= magnitude;
+  z /= magnitude;
+
+  float dot =
+    x * baselineX +
+    y * baselineY +
+    z * baselineZ;
+
+  dot = constrain(dot, -1.0f, 1.0f);
+
+  return acosf(dot) * 180.0f / PI;
+}
+
+// ============================================
+// STATUS TEXT
+// ============================================
+
+const char* statusText() {
+  switch (status) {
+    case NORMAL: return "NORMAL";
+    case ANGLE_WARNING: return "ANGLE WARNING";
+    case GROUND_WARNING: return "GROUND PROXIMITY";
+    case TEMP_WARNING: return "HIGH TEMPERATURE";
+    case CRITICAL: return "CRITICAL ALERT";
+    default: return "SENSOR ERROR";
+  }
+}
+
+// ============================================
+// SENSOR UPDATE
+// ============================================
+
+void updateSensors() {
+  bool rawIR = digitalRead(IR_PIN);
+
+  bool detected =
+    IR_ACTIVE_LOW ? !rawIR : rawIR;
+
+  if (detected) {
+    if (irCount < CONFIRM_COUNT)
+      irCount++;
+  } else {
+    irCount = 0;
+  }
+
+  irDetected = irCount >= CONFIRM_COUNT;
+
+  if (!sensorOK) {
+    status = SENSOR_ERROR;
+    return;
+  }
+
+  float x, y, z, temp;
+
+  if (!readSensor(x, y, z, temp)) {
+    readFailures++;
+
+    if (readFailures >= 5) {
+      sensorOK = false;
+      status = SENSOR_ERROR;
+    }
+
+    return;
+  }
+
+  readFailures = 0;
+
+  temperatureC = temp;
+
+  float rawAngle = calculateAngle(x, y, z);
+
+  if (isnan(rawAngle)) {
+    sensorOK = false;
+    status = SENSOR_ERROR;
+    return;
+  }
+
+  angleChange =
+    0.65f * angleChange +
+    0.35f * rawAngle;
+
+  if (angleChange > maxAngle)
+    maxAngle = angleChange;
+
+  if (temperatureC > maxTemperature)
+    maxTemperature = temperatureC;
+
+  // ANGLE WARNING
+  if (angleChange >= ANGLE_LIMIT) {
+    if (angleCount < CONFIRM_COUNT)
+      angleCount++;
+  } else {
+    angleCount = 0;
+  }
+
+  angleAlert = angleCount >= CONFIRM_COUNT;
+
+  // TEMPERATURE WARNING
+  if (temperatureC >= TEMP_LIMIT) {
+    if (tempCount < CONFIRM_COUNT)
+      tempCount++;
+  } else {
+    tempCount = 0;
+  }
+
+  tempAlert = tempCount >= CONFIRM_COUNT;
+
+  // PRIORITY
+  int warnings =
+    (angleAlert ? 1 : 0) +
+    (tempAlert ? 1 : 0) +
+    (irDetected ? 1 : 0);
+
+  if (warnings >= 2)
+    status = CRITICAL;
+  else if (irDetected)
+    status = GROUND_WARNING;
+  else if (angleAlert)
+    status = ANGLE_WARNING;
+  else if (tempAlert)
+    status = TEMP_WARNING;
+  else
+    status = NORMAL;
+}
+
+// ============================================
+// LIVE DATA ENDPOINT
+// ============================================
+
+void sendData() {
+  String json;
+  json.reserve(320);
+
+  json += "{";
+
+  json += "\"angle\":";
+  json += String(angleChange, 2);
+
+  json += ",\"temperature\":";
+  json += String(temperatureC, 2);
+
+  json += ",\"maxAngle\":";
+  json += String(maxAngle, 2);
+
+  json += ",\"maxTemperature\":";
+  json += String(maxTemperature, 2);
+
+  json += ",\"ir\":";
+  json += irDetected ? "true" : "false";
+
+  json += ",\"angleAlert\":";
+  json += angleAlert ? "true" : "false";
+
+  json += ",\"tempAlert\":";
+  json += tempAlert ? "true" : "false";
+
+  json += ",\"sensorOK\":";
+  json += sensorOK ? "true" : "false";
+
+  json += ",\"uptime\":";
+  json += String(millis() / 1000);
+
+  json += ",\"status\":\"";
+  json += statusText();
+  json += "\"";
+
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// ============================================
+// DASHBOARD WEBSITE
+// ============================================
+
+const char DASHBOARD[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BridgePulse | Control Center</title>
+
+<style>
+:root{
+  --bg:#07100d;
+  --panel:#101e18;
+  --border:#244536;
+  --green:#5cffae;
+  --text:#e3f7e9;
+  --muted:#91b4a0;
+  --amber:#ffc15c;
+  --red:#ff6476;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--text);
+  font-family:Arial,Helvetica,sans-serif;
+}
+.wrap{
+  max-width:1250px;
+  margin:auto;
+  padding:24px;
+}
+header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+  margin-bottom:25px;
+}
+.logo{
+  font-size:clamp(25px,5vw,40px);
+  color:var(--green);
+  font-weight:800;
+  letter-spacing:3px;
+}
+.sub{
+  color:var(--muted);
+  font-size:11px;
+  letter-spacing:2px;
+  margin-top:5px;
+}
+.live{
+  color:var(--green);
+  border:1px solid var(--border);
+  border-radius:30px;
+  padding:10px 14px;
+  font-size:12px;
+}
+.dot{
+  display:inline-block;
+  width:8px;
+  height:8px;
+  border-radius:50%;
+  background:var(--green);
+  margin-right:6px;
+}
+.banner{
+  background:#103524;
+  border:1px solid #297d53;
+  padding:24px;
+  border-radius:15px;
+  text-align:center;
+  margin-bottom:20px;
+  font-size:clamp(20px,4vw,31px);
+  font-weight:bold;
+  color:var(--green);
+}
+.banner small{
+  display:block;
+  font-size:12px;
+  margin-top:10px;
+  font-weight:normal;
+  color:#b3d4c2;
+}
+.banner.warn{
+  background:#50370e;
+  color:var(--amber);
+  border-color:var(--amber);
+}
+.banner.danger{
+  background:#641521;
+  color:#fff;
+  border-color:var(--red);
+  animation:pulse .8s infinite;
+}
+.banner.error{
+  background:#34383a;
+  color:white;
+  border-color:#777;
+}
+@keyframes pulse{
+  50%{background:#2b0710}
+}
+.cards{
+  display:grid;
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:15px;
+  margin-bottom:20px;
+}
+.card,.panel{
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:20px;
+}
+.label{
+  color:var(--muted);
+  font-size:11px;
+  letter-spacing:1.4px;
+}
+.big{
+  color:var(--green);
+  font-size:clamp(22px,3vw,35px);
+  font-weight:700;
+  margin:12px 0;
+}
+.hint{
+  color:var(--muted);
+  font-size:12px;
+}
+.graphs{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:18px;
+}
+.panel h3{
+  font-size:16px;
+  margin:0 0 5px;
+}
+.panel p{
+  color:var(--muted);
+  font-size:12px;
+}
+canvas{
+  width:100%;
+  height:230px;
+  display:block;
+}
+.legend{
+  display:flex;
+  gap:18px;
+  flex-wrap:wrap;
+  font-size:12px;
+  color:var(--muted);
+  margin-top:8px;
+}
+.line{
+  display:inline-block;
+  width:16px;
+  height:3px;
+  vertical-align:middle;
+  margin-right:6px;
+}
+.actual{background:var(--green)}
+.limit{background:var(--amber)}
+.bottom{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:18px;
+  margin-top:18px;
+}
+.compare{
+  width:100%;
+  border-collapse:collapse;
+  margin-top:12px;
+}
+.compare th,.compare td{
+  padding:12px 6px;
+  text-align:left;
+  border-bottom:1px solid var(--border);
+  font-size:13px;
+}
+.compare th{color:var(--muted)}
+.good{color:var(--green)}
+.bad{color:var(--red)}
+footer{
+  text-align:center;
+  color:var(--muted);
+  font-size:11px;
+  padding:30px 0 10px;
+}
+@media(max-width:850px){
+  .cards{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .graphs,.bottom{grid-template-columns:1fr}
+}
+@media(max-width:450px){
+  .wrap{padding:12px}
+  .card,.panel{padding:14px}
+  .big{font-size:24px}
+}
+</style>
+</head>
+
+<body>
+<div class="wrap">
+
+<header>
+  <div>
+    <div class="logo">BRIDGEPULSE</div>
+    <div class="sub">STRUCTURAL MONITORING CONTROL CENTER</div>
+  </div>
+  <div class="live">
+    <span class="dot" id="dot"></span>
+    <span id="connection">CONNECTING</span>
+  </div>
+</header>
+
+<div id="banner" class="banner error">
+  CONNECTING TO ESP32
+  <small id="bannerSub">Waiting for sensor readings</small>
+</div>
+
+<div class="cards">
+  <div class="card">
+    <div class="label">ANGLE CHANGE</div>
+    <div class="big"><span id="angle">--</span>°</div>
+    <div class="hint">Limit: 1.7°</div>
+  </div>
+  <div class="card">
+    <div class="label">MPU TEMPERATURE</div>
+    <div class="big"><span id="temp">--</span>°C</div>
+    <div class="hint">Limit: 36°C</div>
+  </div>
+  <div class="card">
+    <div class="label">GROUND PROXIMITY</div>
+    <div class="big" id="ground">--</div>
+    <div class="hint">IR sensor status</div>
+  </div>
+  <div class="card">
+    <div class="label">ACTIVE WARNINGS</div>
+    <div class="big" id="warnings">--</div>
+    <div class="hint">Out of 3 conditions</div>
+  </div>
+</div>
+
+<div class="graphs">
+
+  <div class="panel">
+    <h3>Angle Change Analysis</h3>
+    <p>Actual angle vs 1.7° warning threshold</p>
+    <canvas id="angleChart"></canvas>
+    <div class="legend">
+      <span><i class="line actual"></i>Actual</span>
+      <span><i class="line limit"></i>Warning limit</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Temperature Analysis</h3>
+    <p>MPU chip temperature vs 36°C threshold</p>
+    <canvas id="tempChart"></canvas>
+    <div class="legend">
+      <span><i class="line actual"></i>Actual</span>
+      <span><i class="line limit"></i>Warning limit</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Ground Proximity Timeline</h3>
+    <p>0 = clear, 1 = ground/object detected</p>
+    <canvas id="irChart"></canvas>
+  </div>
+
+  <div class="panel">
+    <h3>Recorded Statistics</h3>
+    <table class="compare">
+      <tr><th>Metric</th><th>Recorded value</th></tr>
+      <tr><td>Maximum angle</td><td id="maxAngle">--</td></tr>
+      <tr><td>Maximum temperature</td><td id="maxTemp">--</td></tr>
+      <tr><td>ESP32 uptime</td><td id="uptime">--</td></tr>
+      <tr><td>Dashboard samples</td><td id="samples">0</td></tr>
+    </table>
+  </div>
+
+</div>
+
+<div class="bottom">
+
+  <div class="panel">
+    <h3>Reference vs Actual</h3>
+    <p>Configured monitoring conditions</p>
+    <table class="compare">
+      <thead>
+        <tr>
+          <th>Parameter</th>
+          <th>Reference</th>
+          <th>Actual</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Angle change</td>
+          <td>&lt; 1.7°</td>
+          <td id="angleCompare">--</td>
+        </tr>
+        <tr>
+          <td>Temperature</td>
+          <td>&lt; 36°C</td>
+          <td id="tempCompare">--</td>
+        </tr>
+        <tr>
+          <td>IR proximity</td>
+          <td>Clear</td>
+          <td id="irCompare">--</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h3>System Information</h3>
+    <p>BridgePulse 2.0 / ESP32</p>
+    <table class="compare">
+      <tr><td>Motion sensor</td><td>MPU 0x70 / 0x68</td></tr>
+      <tr><td>Angle threshold</td><td>1.7°</td></tr>
+      <tr><td>Temperature threshold</td><td>36°C</td></tr>
+      <tr><td>Dashboard update</td><td>500 ms</td></tr>
+      <tr><td>Chart window</td><td>60 seconds</td></tr>
+    </table>
+  </div>
+
+</div>
+
+<footer>
+  BRIDGEPULSE 2.0 | EXPERIMENTAL MODEL BRIDGE
+  <br><br>
+  Reference limits are demonstration settings,
+  not certified structural safety standards.
+</footer>
+
+</div>
+
+<script>
+
+// ============================================
+// GRAPH HISTORY
+// 120 samples x 500ms = 60 seconds
+// ============================================
+
+const MAX_POINTS = 120;
+
+const angleHistory = [];
+const tempHistory = [];
+const irHistory = [];
+
+let lastDataTime = 0;
+let busy = false;
+
+// ============================================
+// CHART RENDERER - NO EXTERNAL LIBRARIES
+// ============================================
+
+function drawChart(id, values, threshold, type) {
+  const canvas = document.getElementById(id);
+  const rect = canvas.getBoundingClientRect();
+
+  const width = Math.max(100, rect.width);
+  const height = Math.max(100, rect.height);
+
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+
+  const left = 42;
+  const right = 12;
+  const top = 14;
+  const bottom = 30;
+
+  const plotW = width - left - right;
+  const plotH = height - top - bottom;
+
+  let minY = 0;
+  let maxY = 1;
+
+  if (type === 'ir') {
+    maxY = 1.2;
+  } else if (type === 'angle') {
+    maxY = Math.max(
+      3,
+      threshold * 1.5,
+      ...values
+    );
+    maxY *= 1.1;
+  } else {
+    minY = Math.min(
+      15,
+      ...values
+    ) - 2;
+
+    maxY = Math.max(
+      40,
+      threshold + 4,
+      ...values
+    ) + 2;
+  }
+
+  function px(i) {
+    return left +
+      (i / (MAX_POINTS - 1)) * plotW;
+  }
+
+  function py(value) {
+    return top + plotH -
+      ((value - minY) / (maxY - minY)) * plotH;
+  }
+
+  ctx.clearRect(0,0,width,height);
+
+  // Grid and Y labels
+
+  ctx.font = '11px Arial';
+  ctx.fillStyle = '#91b4a0';
+
+  for (let i = 0; i <= 4; i++) {
+    const y = top + (plotH / 4) * i;
+
+    ctx.strokeStyle = '#284337';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(left,y);
+    ctx.lineTo(width-right,y);
+    ctx.stroke();
+
+    const val = maxY -
+      (maxY-minY) * i / 4;
+
+    ctx.fillText(val.toFixed(1),4,y+4);
+  }
+
+  // Threshold line
+
+  if (type !== 'ir') {
+    const y = py(threshold);
+
+    ctx.strokeStyle = '#ffc15c';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6,5]);
+
+    ctx.beginPath();
+    ctx.moveTo(left,y);
+    ctx.lineTo(width-right,y);
+    ctx.stroke();
+
+    ctx.setLineDash([]);
+  }
+
+  // Actual readings
+
+  if (values.length > 0) {
+    ctx.beginPath();
+
+    values.forEach((v,i) => {
+      const x = px(MAX_POINTS-values.length+i);
+      const y = py(v);
+
+      if (i === 0) ctx.moveTo(x,y);
+      else ctx.lineTo(x,y);
+    });
+
+    ctx.strokeStyle = '#5cffae';
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.stroke();
+
+    // Latest reading marker
+
+    const last = values.length-1;
+
+    ctx.fillStyle = '#5cffae';
+    ctx.beginPath();
+    ctx.arc(
+      px(MAX_POINTS-values.length+last),
+      py(values[last]),
+      3.5,0,Math.PI*2
+    );
+    ctx.fill();
+  }
+
+  ctx.fillStyle = '#91b4a0';
+  ctx.font = '11px Arial';
+
+  ctx.fillText('60s ago',left,height-7);
+
+  ctx.textAlign = 'right';
+  ctx.fillText('Now',width-right,height-7);
+  ctx.textAlign = 'left';
+}
+
+function renderCharts() {
+  drawChart('angleChart',angleHistory,1.7,'angle');
+  drawChart('tempChart',tempHistory,36,'temp');
+  drawChart('irChart',irHistory,0,'ir');
+}
+
+function addSample(arr,value) {
+  arr.push(value);
+
+  if (arr.length > MAX_POINTS)
+    arr.shift();
+}
+
+function setComparison(id,text,alert) {
+  const el = document.getElementById(id);
+
+  el.textContent = text;
+  el.className = alert ? 'bad' : 'good';
+}
+
+// ============================================
+// UPDATE DASHBOARD
+// ============================================
+
+async function updateDashboard() {
+  if (busy) return;
+  busy = true;
+
+  try {
+    const response = await fetch('/data',{
+      cache:'no-store'
+    });
+
+    if (!response.ok)
+      throw new Error('Network error');
+
+    const d = await response.json();
+
+    lastDataTime = Date.now();
+
+    const angle = Number(d.angle);
+    const temp = Number(d.temperature);
+
+    document.getElementById('angle')
+      .textContent = angle.toFixed(2);
+
+    document.getElementById('temp')
+      .textContent = temp.toFixed(2);
+
+    document.getElementById('ground')
+      .textContent = d.ir ? 'DETECTED' : 'CLEAR';
+
+    document.getElementById('maxAngle')
+      .textContent =
+      Number(d.maxAngle).toFixed(2)+'°';
+
+    document.getElementById('maxTemp')
+      .textContent =
+      Number(d.maxTemperature).toFixed(2)+'°C';
+
+    document.getElementById('uptime')
+      .textContent = d.uptime+' seconds';
+
+    const warnings =
+      Number(d.angleAlert) +
+      Number(d.tempAlert) +
+      Number(d.ir);
+
+    document.getElementById('warnings')
+      .textContent = warnings;
+
+    setComparison(
+      'angleCompare',
+      angle.toFixed(2)+'°',
+      d.angleAlert
+    );
+
+    setComparison(
+      'tempCompare',
+      temp.toFixed(2)+'°C',
+      d.tempAlert
+    );
+
+    setComparison(
+      'irCompare',
+      d.ir ? 'DETECTED' : 'CLEAR',
+      d.ir
+    );
+
+    const banner = document.getElementById('banner');
+    const sub = document.getElementById('bannerSub');
+
+    if (!d.sensorOK) {
+      banner.className = 'banner error';
+      banner.firstChild.textContent = 'SENSOR ERROR';
+      sub.textContent = 'Check MPU connection';
+    }
+    else if (d.status === 'CRITICAL ALERT') {
+      banner.className = 'banner danger';
+      banner.firstChild.textContent = 'CRITICAL ALERT';
+      sub.textContent = 'Multiple warnings detected';
+    }
+    else if (d.status === 'GROUND PROXIMITY') {
+      banner.className = 'banner danger';
+      banner.firstChild.textContent = 'GROUND PROXIMITY';
+      sub.textContent = 'Inspect model bridge clearance';
+    }
+    else if (d.status === 'ANGLE WARNING') {
+      banner.className = 'banner warn';
+      banner.firstChild.textContent = 'ANGLE WARNING';
+      sub.textContent = '1.7° threshold exceeded';
+    }
+    else if (d.status === 'HIGH TEMPERATURE') {
+      banner.className = 'banner warn';
+      banner.firstChild.textContent = 'HIGH TEMPERATURE';
+      sub.textContent = 'MPU temperature reached 36°C';
+    }
+    else {
+      banner.className = 'banner';
+      banner.firstChild.textContent = 'BRIDGE NORMAL';
+      sub.textContent = 'All monitored conditions normal';
+    }
+
+    document.getElementById('connection')
+      .textContent = 'LIVE';
+
+    document.getElementById('dot')
+      .style.background = '#5cffae';
+
+    // Only graph valid readings
+    if (d.sensorOK) {
+      addSample(angleHistory,angle);
+      addSample(tempHistory,temp);
+      addSample(irHistory,d.ir ? 1 : 0);
+    }
+
+    document.getElementById('samples')
+      .textContent = angleHistory.length;
+
+    renderCharts();
+
+  } catch(error) {
+    document.getElementById('connection')
+      .textContent = 'OFFLINE';
+
+    document.getElementById('dot')
+      .style.background = '#ff6476';
+
+    const banner = document.getElementById('banner');
+    banner.className = 'banner error';
+    banner.firstChild.textContent = 'CONNECTION LOST';
+
+    document.getElementById('bannerSub')
+      .textContent = 'Unable to reach ESP32';
+  } finally {
+    busy = false;
+  }
+}
+
+// Update every 500ms
+setInterval(updateDashboard,500);
+
+window.addEventListener('resize',renderCharts);
+
+renderCharts();
+updateDashboard();
+
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================
+// WEBSITE ROUTES
+// ============================================
+
+void showPage() {
+  server.send_P(
+    200,
+    "text/html",
+    DASHBOARD
+  );
+}
+
+// ============================================
+// LCD
+// ============================================
+
+void updateLCD() {
+  lcd.clear();
+
+  switch (status) {
+    case NORMAL:
+      lcd.setCursor(0,0);
+      lcd.print("BRIDGE NORMAL");
+      lcd.setCursor(0,1);
+      lcd.print("A:");
+      lcd.print(angleChange,1);
+      lcd.print(" T:");
+      lcd.print(temperatureC,1);
+      break;
+
+    case ANGLE_WARNING:
+      lcd.setCursor(0,0);
+      lcd.print("ANGLE WARNING");
+      lcd.setCursor(0,1);
+      lcd.print("ANGLE:");
+      lcd.print(angleChange,2);
+      break;
+
+    case GROUND_WARNING:
+      lcd.setCursor(0,0);
+      lcd.print("GROUND DETECTED");
+      lcd.setCursor(0,1);
+      lcd.print("CHECK CLEARANCE");
+      break;
+
+    case TEMP_WARNING:
+      lcd.setCursor(0,0);
+      lcd.print("HIGH TEMPERATURE");
+      lcd.setCursor(0,1);
+      lcd.print("TEMP:");
+      lcd.print(temperatureC,1);
+      lcd.print("C");
+      break;
+
+    case CRITICAL:
+      lcd.setCursor(0,0);
+      lcd.print("CRITICAL ALERT");
+      lcd.setCursor(0,1);
+      lcd.print("INSPECT BRIDGE");
+      break;
+
+    default:
+      lcd.setCursor(0,0);
+      lcd.print("SENSOR ERROR");
+      lcd.setCursor(0,1);
+      lcd.print("CHECK MPU");
+      break;
+  }
+}
+
+// ============================================
+// SETUP
+// ============================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(IR_PIN,INPUT);
+
+  Wire.begin(LCD_SDA,LCD_SCL);
+  MPU.begin(MPU_SDA,MPU_SCL,100000);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("BRIDGEPULSE 2.0");
+
+  sensorOK = initializeMPU();
+
+  if (sensorOK) {
+    lcd.clear();
+    lcd.print("CALIBRATING");
+    lcd.setCursor(0,1);
+    lcd.print("KEEP STILL");
+
+    sensorOK = calibrateMPU();
+  }
+
+  if (sensorOK) {
+    status = NORMAL;
+    lcd.clear();
+    lcd.print("SYSTEM READY");
+    Serial.println("MPU READY");
+  } else {
+    status = SENSOR_ERROR;
+    lcd.clear();
+    lcd.print("SENSOR ERROR");
+    Serial.println("MPU ERROR");
+  }
+
+  WiFi.mode(WIFI_AP);
+
+  WiFi.softAP(
+    WIFI_NAME,
+    WIFI_PASS
+  );
+
+  server.on("/",showPage);
+  server.on("/data",sendData);
+  server.begin();
+
+  Serial.println();
+  Serial.println("BRIDGEPULSE 2.0 READY");
+  Serial.print("Dashboard: http://");
+  Serial.println(WiFi.softAPIP());
+}
+
+// ============================================
+// LOOP
+// ============================================
+
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+
+  if (now-lastSample >= SAMPLE_MS) {
+    lastSample = now;
+    updateSensors();
+  }
+
+  if (now-lastLCD >= LCD_MS) {
+    lastLCD = now;
+    updateLCD();
+  }
+}
